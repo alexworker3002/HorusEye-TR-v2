@@ -1,0 +1,920 @@
+\PassOptionsToPackage{quiet}{fontspec}
+\documentclass[11pt,a4paper,UTF8,fontset=fandol]{ctexart}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{mathrsfs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{setspace}
+\usepackage{titlesec}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\setstretch{1.12}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection.}{0.5em}{}
+
+\newtheorem{theorem}{定理}[section]
+\newtheorem{lemma}[theorem]{引理}
+\newtheorem{proposition}[theorem]{命题}
+\newtheorem{corollary}[theorem]{推论}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{定义}
+\newtheorem{assumption}[theorem]{假设}
+\newtheorem{remark}[theorem]{备注}
+
+\DeclareMathOperator{\Lip}{Lip}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\SG}{SG}
+\DeclareMathOperator{\EMA}{EMA}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\clip}{clip}
+
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\abs}[1]{\left\lvert#1\right\rvert}
+\newcommand{\ip}[2]{\left\langle#1,#2\right\rangle}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cH}{\mathcal{H}}
+\newcommand{\cS}{\mathcal{S}}
+
+\begin{document}
+
+\title{HorusEye-TR: 稳定双反馈 Noisier-to-Noisy 自监督去噪理论分析\\(Stable Dual-Feedback Noisier-to-Noisy Surrogate Model, v2.0)}
+\author{理论分析团队}
+\date{\today}
+\maketitle
+
+\begin{abstract}
+本文定义并分析一个面向可执行训练的单层自监督 CT 去噪 surrogate model。模型保留两个核心反馈：第一条为 noisier-to-noisy 去噪反馈，即由结构预测残差构造更噪输入，并训练去噪器映射回原始含噪切片；第二条为 denoised-anchor 结构反馈，即使用去噪器的指数滑动平均输出作为停止梯度锚点，反过来稳定结构预测器。整体架构只使用轻量结构预测器、残差形式去噪器、标量残差归一化、固定质量门控、空间结构保护权重和两时间尺度训练，不依赖复杂 bucket 校准或注意力分支。理论部分给出残差泄漏界、标量注入的条件均值控制、noisier-to-noisy population 偏差分解、风险摄动界、EMA 锚点误差传播、闭环压缩条件以及两时间尺度随机逼近兼容性。所有结论均为局部、条件性结果，目标是在保持理论可审计性的同时，给出更稳定、更容易复现实验的自监督去噪框架。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{引言与定位}
+
+在缺少严格配对的低剂量与常规剂量 CT 数据时，自监督去噪需要从含噪样本自身构造训练信号。本文研究的 HorusEye-TR v2.0 将训练目标限制在一个更小、更可执行的理论对象内：去噪器训练使用完整切片输入，目标为同一基础含噪切片；结构预测器只负责从相邻切片估计中心层的低频结构，并为残差注入提供候选伪噪声。
+
+模型由两个网络组成。结构预测器 $P_\phi$ 从相邻切片 $(x_{h-1},x_{h+1})$ 预测中心切片的主体结构；去噪器 $D_\theta$ 以残差形式 $D_\theta(x)=x-R_\theta(x)$ 输出去噪结果。训练中，残差候选由
+\begin{equation}
+    \hat r_h=\cH_\tau\big(x_h-P_\phi(x_{h-1},x_{h+1})\big)
+\end{equation}
+给出。通过简单质量门控和标量归一化后，将残差注入到另一个体积的基础切片 $x_c$ 上：
+\begin{equation}
+    y_c=x_c+\alpha_t z_h,
+    \qquad
+    D_\theta(y_c)\approx x_c.
+\end{equation}
+其中 $z_h$ 是中心化、缩放后的残差，$\alpha_t$ 是有界注入强度。推理阶段只使用
+\begin{equation}
+    x\longmapsto D_\theta(x).
+\end{equation}
+
+本文特别区分两个闭环。第一是\emph{去噪反馈环}：$P_\phi$ 决定残差候选，残差候选决定 noisier-to-noisy 训练对，训练对更新 $D_\theta$。第二是\emph{结构反馈环}：$D_\theta$ 的 EMA 版本 $D_{\bar\theta}$ 给出 denoised anchor，anchor 更新 $P_\phi$，进而影响下一轮残差。理论稳定性的关键不是让两个反馈无限制地同步强化，而是通过 EMA、停止梯度、残差门控、标量强度上界和慢速结构更新使反馈映射局部压缩。
+
+本文贡献如下：
+\begin{enumerate}[leftmargin=2em]
+    \item 给出一个只依赖轻量卷积网络、标量残差注入和 EMA 锚点的双反馈自监督去噪架构。
+    \item 将训练目标明确解释为 noisier-to-noisy population risk，并显式保留相对 clean signal 的偏差项。
+    \item 给出结构预测残差泄漏界，将切片光滑误差、层特异结构、预测器表达误差、邻层噪声、锚点偏差和门控残留误差分离。
+    \item 用标量归一化替代复杂分桶或频域校准，并给出条件均值控制与风险摄动界。
+    \item 给出 EMA denoised-anchor 的误差传播、闭环压缩条件和两时间尺度随机逼近兼容性。
+    \item 列出可执行训练流程、默认稳定化参数和必要实证验证项。
+\end{enumerate}
+
+\section{数学基础与符号}
+
+\subsection{数据模型}
+
+三维 CT 体数据沿轴向 $z$ 被表示为二维切片序列。第 $h$ 层切片向量化为 $x_h\in\R^m$。观测模型为
+\begin{equation}
+\label{eq:observation-model}
+    x_h=s_h+n_h,
+\end{equation}
+其中 $s_h$ 为潜在 clean structure，$n_h$ 为采集、重建和电子噪声。本文在一个近似同质的采集域内建立理论；若实际数据包含明显不同协议，应先按协议训练独立模型或将协议作为固定条件变量进入网络，但本文不引入动态 bucket 校准机制。
+
+\subsection{基础算子}
+
+\begin{definition}[平滑、高通与梯度算子]
+令 $K_\sigma$ 为离散高斯平滑核，$K_{\mathrm{low}}$ 为轻度低通核，定义
+\begin{equation}
+    G_\sigma u:=\nabla(K_\sigma*u),
+    \qquad
+    \cH_\tau u:=u-K_\tau*u.
+\end{equation}
+假设 $\norm{\cH_\tau}_{2\to2}\le1$，$\norm{K_\sigma}_{2\to2}<\infty$，$\norm{K_{\mathrm{low}}}_{2\to2}<\infty$，$\norm{G_\sigma}_{2\to2}<\infty$。
+\end{definition}
+
+\begin{definition}[Charbonnier 惩罚]
+\begin{equation}
+    \rho_\varepsilon(r):=\sqrt{r^2+\varepsilon^2},
+    \qquad
+    \varepsilon>0.
+\end{equation}
+其导数满足 $\abs{\rho_\varepsilon'(r)}\le1$。该性质用于控制输出损失梯度，而不是声称 Charbonnier population minimizer 等同于平方损失条件期望。
+\end{definition}
+
+\section{稳定双反馈架构}
+
+\subsection{结构预测器}
+
+结构预测器定义为
+\begin{equation}
+\label{eq:predictor}
+    \tilde s_h=P_\phi(x_{h-1},x_{h+1}).
+\end{equation}
+实际实现可采用浅层 U-Net、DnCNN 风格卷积网络或残差 CNN。$P_\phi$ 的职责不是恢复完整 clean 图像，而是提供中心层主体结构估计，使高通残差
+\begin{equation}
+\label{eq:raw-residual}
+    \hat r_h=\cH_\tau(x_h-\tilde s_h)
+\end{equation}
+尽量接近高通噪声 $\cH_\tau n_h$。若中心层包含无法由相邻层预测的微小病灶、钙化或突变边界，这些结构可能进入 $\hat r_h$，因此必须用门控和结构保护实验进行控制。
+
+\subsection{残差质量门控}
+
+为避免明显结构化残差进入训练池，定义两个可直接实现的质量指标：
+\begin{equation}
+\label{eq:simple-gates}
+    q_{\mathrm{low}}(\hat r_h)=
+    \frac{\norm{K_\sigma*\hat r_h}}{\norm{\hat r_h}+\epsilon_g},
+    \qquad
+    q_{\mathrm{corr}}(\hat r_h,x_h)=
+    \frac{\abs{\ip{\hat r_h}{K_\sigma*x_h}}}
+    {\norm{\hat r_h}\norm{K_\sigma*x_h}+\epsilon_g}.
+\end{equation}
+残差被接受当且仅当
+\begin{equation}
+\label{eq:gate-condition}
+    q_{\mathrm{low}}\le\xi_{\mathrm{low}},
+    \qquad
+    q_{\mathrm{corr}}\le\xi_{\mathrm{corr}}.
+\end{equation}
+这里 $\xi_{\mathrm{low}}$ 与 $\xi_{\mathrm{corr}}$ 可先取固定阈值。门控不能证明残差纯净，但可以阻止低频解剖结构或与主体结构高度相关的残差在训练早期污染残差池。
+
+\subsection{标量残差归一化与注入}
+
+对通过门控的残差，维护残差均值和尺度的 EMA 估计：
+\begin{equation}
+\label{eq:residual-stat}
+    \hat\mu_t=\EMA(\hat r_h),
+    \qquad
+    \hat\sigma_{r,t}^2=\EMA\big(\norm{\hat r_h-\hat\mu_t}^2/m\big).
+\end{equation}
+定义标量归一化算子
+\begin{equation}
+\label{eq:scalar-normalizer}
+    T_t(u)=a_t(u-\hat\mu_t),
+    \qquad
+    a_t=\clip\left(
+    \frac{\hat\sigma_{x,t}}{\hat\sigma_{r,t}+\epsilon_a},
+    0,
+    a_{\max}
+    \right),
+\end{equation}
+其中 $\hat\sigma_{x,t}$ 是基础切片高通尺度或预设目标尺度估计，$a_{\max}<\infty$。记
+\begin{equation}
+\label{eq:normalized-residual}
+    z_h=T_t(\hat r_h).
+\end{equation}
+从另一个体积采样基础切片 $x_c=s_c+n_c$，要求 $V_c\ne V_h$，构造 noisier 输入
+\begin{equation}
+\label{eq:yc-scalar}
+    y_c=x_c+\alpha_t z_h,
+    \qquad
+    0<\alpha_{\min}\le\alpha_t\le\alpha_{\max}<\infty.
+\end{equation}
+$\alpha_{\min}>0$ 避免训练对退化为恒等映射；$\alpha_{\max}$ 控制训练输入与推理输入之间的噪声强度偏移。
+
+\subsection{残差形式去噪器}
+
+去噪器采用残差形式
+\begin{equation}
+\label{eq:denoiser-residual}
+    D_\theta(u)=u-\eta_D R_\theta(u),
+    \qquad
+    0<\eta_D\le\eta_{\max}.
+\end{equation}
+$R_\theta$ 由轻量卷积残差网络实现。该形式使网络主要学习待移除成分，而非直接生成完整图像；在低剂量 CT 场景下，这通常更容易约束动态范围和局部 Lipschitz 常数。训练目标为
+\begin{equation}
+\label{eq:n2n-training-pair}
+    D_\theta(x_c+\alpha_t z_h)\approx x_c.
+\end{equation}
+推理阶段直接输出 $D_\theta(x)$。
+
+\subsection{EMA denoised anchor}
+
+维护去噪器参数的 EMA 版本：
+\begin{equation}
+\label{eq:ema-theta}
+    \bar\theta_{t+1}=\rho_{\mathrm{ema}}\bar\theta_t+
+    (1-\rho_{\mathrm{ema}})\theta_t,
+    \qquad
+    0<\rho_{\mathrm{ema}}<1.
+\end{equation}
+定义结构预测器锚点
+\begin{equation}
+\label{eq:ema-anchor}
+    \bar x_h=\SG\big(D_{\bar\theta}(x_h)\big).
+\end{equation}
+停止梯度保证预测器损失不直接更新去噪器。EMA 保证锚点比当前 $D_\theta$ 的单步输出更平滑，从而降低结构反馈环的高频振荡风险。
+
+\section{损失函数与训练流程}
+
+\subsection{去噪器损失}
+
+令
+\begin{equation}
+\label{eq:denoise-residual}
+    e_c=D_\theta(y_c)-x_c.
+\end{equation}
+为降低层特异微小结构被当作伪噪声压制的风险，引入空间保护权重
+\begin{equation}
+\label{eq:protection-weight}
+    0\le\omega_i(x_c)\le1,
+    \qquad
+    i=1,\ldots,m.
+\end{equation}
+在疑似微小钙化、单层病灶、细小骨折线或其他需要保护的突变结构附近，$\omega_i(x_c)$ 取较小值；在普通背景区域取接近 $1$。该权重可由局部梯度、候选病灶检测器、拓扑异常分数、人工标注保护区域或保守启发式规则生成。若实验阶段暂不启用结构保护，可取 $\omega_i\equiv1$，但理论接口仍保留。
+去噪损失定义为
+\begin{equation}
+\label{eq:LD-def}
+\begin{aligned}
+\cL_D(\theta)
+=&\ \E\left[\sum_{i=1}^m\omega_i(x_c)\rho_\varepsilon((e_c)_i)\right]\\
+&+\lambda_g\E\left[\sum_{i,j}\rho_\varepsilon\big((G_\sigma e_c)_{i,j}\big)\right]\\
+&+\lambda_{\mathrm{low}}\E\left[
+    \norm{K_{\mathrm{low}}*D_\theta(y_c)-K_{\mathrm{low}}*x_c}_1
+\right].
+\end{aligned}
+\end{equation}
+第一项以空间加权方式约束 noisier 输入回到较低噪目标，并在疑似层特异微小结构区域降低反向传播压力；第二项抑制结构边缘附近的残差振荡；第三项只在低频域约束主体解剖动态范围，避免把目标 $x_c$ 中的高频噪声方差误当作必须保留的结构。
+
+\subsection{结构预测器损失}
+
+结构预测器损失定义为
+\begin{equation}
+\label{eq:LP-def}
+\begin{aligned}
+\cL_P(\phi)
+=&\ \E\left[
+    \norm{K_\sigma*P_\phi(x_{h-1},x_{h+1})-K_\sigma*\bar x_h}_1
+\right]\\
+&+\lambda_h\E\left[
+    \norm{\cH_\tau P_\phi(x_{h-1},x_{h+1})
+    -\cH_\tau\left((x_{h-1}+x_{h+1})/2\right)}_1
+\right].
+\end{aligned}
+\end{equation}
+第一项使预测器的低频结构跟踪 denoised anchor；第二项限制预测器在高频区域生成与邻层平均不一致的伪结构。由于 $\bar x_h$ 使用停止梯度，预测器更新不会通过该项反向扰动去噪器。
+
+\subsection{可执行训练日程}
+
+本文采用三阶段训练日程。
+
+\paragraph{阶段 I：固定结构残差池，预热去噪器。}
+使用
+\begin{equation}
+    P^{(0)}(x_{h-1},x_{h+1})=
+    K_\sigma*\left((x_{h-1}+x_{h+1})/2\right)
+\end{equation}
+构造初始残差池，通过式 \eqref{eq:gate-condition} 筛选后训练 $D_\theta(y_c)\approx x_c$。建议 $\alpha_t$ 从小的正值线性或余弦升至目标强度，例如 $0.02$ 到 $0.15$。
+
+\paragraph{阶段 II：EMA 锚点预热结构预测器。}
+固定或慢速更新 $D_\theta$，用 $D_{\bar\theta}(x_h)$ 产生 $\bar x_h$，优化 $\cL_P$。该阶段使 $P_\phi$ 进入局部可容许域，降低后续残差泄漏。
+
+\paragraph{阶段 III：慢速双反馈联合训练。}
+每步更新 $D_\theta$，每 $k$ 步更新一次 $P_\phi$，或取学习率比
+\begin{equation}
+    \eta_{\phi,t}/\eta_{\theta,t}\to0.
+\end{equation}
+每步更新 EMA 参数。残差统计 $\hat\mu_t,\hat\sigma_{r,t}$ 也使用 EMA，门控阈值在主实验中保持固定，以避免额外非平稳性。
+
+\section{网络稳定化接口}
+
+\subsection{卷积残差块}
+
+去噪器和预测器均可由卷积残差块组成。单个块写为
+\begin{equation}
+\label{eq:conv-residual-block}
+    u_{\ell+1}=u_\ell+\Gamma_\ell F_\ell(u_\ell),
+\end{equation}
+其中 $F_\ell$ 是卷积、归一化和逐点非线性的组合，$\Gamma_\ell=\diag(\gamma_{\ell,1},\ldots,\gamma_{\ell,m})$ 是可学习或固定残差缩放。实现中可通过谱归一化、权重衰减、残差缩放或梯度裁剪控制 $\norm{J_{F_\ell}}$ 和 $\norm{\Gamma_\ell}$。
+
+\subsection{残差形式输出的局部稳定性}
+
+若 $R_\theta$ 在局部可容许域内为 $L_R$-Lipschitz，则
+\begin{equation}
+    \norm{D_\theta(u)-D_\theta(v)}
+    \le (1+\eta_D L_R)\norm{u-v}.
+\end{equation}
+因此减小 $\eta_D$、限制 $R_\theta$ 的谱范数、缩小网络深度或使用残差缩放，都会直接降低去噪器的局部 Lipschitz 常数。本文将这些实现细节统一吸收到局部有界假设中。
+
+\section{理论假设}
+\label{sec:assumptions}
+
+\begin{assumption}[(A1) 主体结构二阶切片光滑与层特异结构分解]
+中心 clean structure 分解为
+\begin{equation}
+    s_h=s_h^{\mathrm{sm}}+\ell_h,
+\end{equation}
+其中 $s_h^{\mathrm{sm}}$ 满足二阶切片光滑性：
+\begin{equation}
+\label{eq:slice-smooth}
+    \left\|s_h^{\mathrm{sm}}-
+    \frac{s_{h-1}^{\mathrm{sm}}+s_{h+1}^{\mathrm{sm}}}{2}
+    \right\|
+    \le c_0\kappa\Delta z^2.
+\end{equation}
+$\ell_h$ 表示单层病灶、微小钙化、突变边界或其他无法由邻层二阶光滑性解释的结构。
+\end{assumption}
+
+\begin{assumption}[(A2) 跨体积残差来源独立性]
+当 $V_c\ne V_h$ 时，经过门控与标量归一化的残差 $z_h$ 与基础切片 $x_c$ 条件独立于采集域：
+\begin{equation}
+    z_h\perp x_c.
+\end{equation}
+若数据来自多个显著不同协议，该假设应在每个协议子域内分别成立。
+\end{assumption}
+
+\begin{assumption}[(A3) 标量残差统计估计]
+存在理想高通残差均值 $\mu^\star$，且 EMA 均值估计满足
+\begin{equation}
+    \E[\hat\mu_t]=\mu^\star,
+    \qquad
+    \E\norm{\hat\mu_t-\mu^\star}\le\epsilon_\mu.
+\end{equation}
+标量归一化系数满足 $0\le a_t\le a_{\max}$。实际归一化注入残差分布与理想注入噪声 $\xi$ 的差异满足
+\begin{equation}
+\label{eq:scalar-calibration}
+    W_1\big(\mathcal L(\alpha_t T_t(\cH_\tau n_h)),
+    \mathcal L(\xi)\big)\le\epsilon_{\mathrm{cal}},
+\end{equation}
+其中 $\E[\xi]=0$，$\xi$ 与 $x_c$ 独立。
+\end{assumption}
+
+\begin{assumption}[(A4) 残差质量门控有效性]
+令 $\Pi_{\cS}$ 表示投影到低频解剖结构子空间的算子。通过式 \eqref{eq:gate-condition} 的残差满足
+\begin{equation}
+    \E\norm{\Pi_{\cS}(\hat r_h)}\le\epsilon_{\mathrm{gate}}.
+\end{equation}
+该假设表示门控能够在统计意义上抑制结构泄漏，而非保证每个残差样本都为纯噪声。
+\end{assumption}
+
+\begin{assumption}[(A5) 结构预测器局部 Lipschitz 与表达误差]
+在局部可容许域内，$P_\phi$ 对两个输入切片为 $L_P$-Lipschitz 连续。存在表达误差 $\epsilon_P$，使干净邻层输入下
+\begin{equation}
+\label{eq:predictor-expression}
+    \norm{
+    P_\phi(s_{h-1},s_{h+1})-s_h^{\mathrm{sm}}
+    }
+    \le
+    \epsilon_P+c_0\kappa\Delta z^2.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[(A6) 卷积残差网络局部有界]
+对每个卷积残差块，存在 $K_\ell<\infty$ 与 $\gamma_\ell<\infty$，使
+\begin{equation}
+    \norm{J_{F_\ell}}\le K_\ell,
+    \qquad
+    \norm{\Gamma_\ell}\le\gamma_\ell.
+\end{equation}
+去噪残差分支 $R_\theta$ 在局部可容许域内为 $L_R$-Lipschitz，因此 $D_\theta$ 为 $L_D$-Lipschitz。
+\end{assumption}
+
+\begin{assumption}[(A7) noisier-to-noisy 可识别接口]
+令理想 noisier 输入为 $y=x+\xi$，其中 $\xi$ 与 $x=s+n$ 独立、均值为零，并与目标噪声具有可接受的强度匹配。平方损失 population minimizer
+\begin{equation}
+    D^\star(y)=\E[x\mid y]
+\end{equation}
+在推理输入 $x$ 上相对 clean signal 的偏差满足
+\begin{equation}
+\label{eq:n2n-interface}
+    \E\norm{D^\star(x)-s}\le\epsilon_{\mathrm{N2N}}.
+\end{equation}
+该假设吸收真实 CT 噪声条件相关性、注入噪声分布误差以及 noisier 训练输入到自然 noisy 推理输入之间的强度偏移，必须通过实证检验。
+\end{assumption}
+
+\begin{assumption}[(A8) EMA 锚点进入局部盆地]
+预热后，EMA 去噪器锚点满足
+\begin{equation}
+\label{eq:anchor-quality}
+    \E\norm{D_{\bar\theta}(x_h)-s_h}\le\epsilon_A.
+\end{equation}
+此外，当前去噪器与 EMA 去噪器在局部域内的输出漂移满足
+\begin{equation}
+    \E\norm{D_\theta(x_h)-D_{\bar\theta}(x_h)}
+    \le\epsilon_{\mathrm{ema}}.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[(A9) 双反馈误差耦合压缩]
+在局部训练盆地内，定义残差误差 $e_R$ 与锚点误差 $e_A$。存在非负常数 $B_R,B_A,C_A,C_R$，使
+\begin{equation}
+\label{eq:feedback-compression}
+    e_R\le B_R+C_Ae_A,
+    \qquad
+    e_A\le B_A+C_Re_R,
+    \qquad
+    C_AC_R<1.
+\end{equation}
+该条件排除“锚点偏差污染结构预测器、结构预测器污染残差池、残差池反向污染去噪器、去噪器继续污染锚点”的非压缩退化循环。
+\end{assumption}
+
+\begin{assumption}[(A10) 两时间尺度步长与局部稳定性]
+设结构预测器步长为 $\eta_{\phi,t}$，去噪器步长为 $\eta_{\theta,t}$，满足
+\begin{equation}
+\label{eq:two-timescale-steps}
+    \sum_t\eta_{\phi,t}=\sum_t\eta_{\theta,t}=\infty,
+    \qquad
+    \sum_t(\eta_{\phi,t}^2+\eta_{\theta,t}^2)<\infty,
+    \qquad
+    \frac{\eta_{\phi,t}}{\eta_{\theta,t}}\to0.
+\end{equation}
+固定 $\phi$ 时，快系统存在局部稳定吸引分支 $\lambda(\phi)$；约化慢系统存在局部 Lyapunov 函数。EMA 参数满足 $0<1-\rho_{\mathrm{ema}}\ll1$，且不会破坏局部稳定分支。
+\end{assumption}
+
+\begin{assumption}[(A11) 随机梯度与局部紧性]
+随机梯度噪声为 martingale difference，且二阶矩有界。训练迭代以高概率保持在局部可容许紧集 $\mathcal U_{\mathrm{adm}}$ 内；在该集合内，上述 Lipschitz、梯度有界和统计估计条件同时成立。
+\end{assumption}
+
+\section{主要理论结果}
+\label{sec:main-results}
+
+\begin{lemma}[卷积残差块 Jacobian 上界]
+\label{lem:residual-block}
+在 A6 成立时，式 \eqref{eq:conv-residual-block} 的单层 Jacobian 满足
+\begin{equation}
+\label{eq:block-jac-bound}
+    \norm{J_\ell}\le1+\gamma_\ell K_\ell.
+\end{equation}
+若网络由 $L$ 个此类块复合而成，则整体局部 Lipschitz 常数可由
+\begin{equation}
+\label{eq:network-lip-bound}
+    \prod_{\ell=1}^L(1+\gamma_\ell K_\ell)
+\end{equation}
+控制。
+\end{lemma}
+
+\begin{proof}
+由链式法则，
+\begin{equation}
+    J_\ell=I+\Gamma_\ell J_{F_\ell}(u_\ell).
+\end{equation}
+取谱范数并使用三角不等式与次可乘性，得到
+\begin{equation}
+    \norm{J_\ell}
+    \le\norm{I}+\norm{\Gamma_\ell}\norm{J_{F_\ell}}
+    \le1+\gamma_\ell K_\ell.
+\end{equation}
+多层网络的 Jacobian 是各层 Jacobian 的乘积。谱范数满足次可乘性，因此整体上界为各单层上界的乘积。
+\end{proof}
+
+\begin{proposition}[残差形式去噪器 Lipschitz 上界]
+\label{prop:denoiser-lip}
+若 $R_\theta$ 在局部可容许域内为 $L_R$-Lipschitz，且 $D_\theta(u)=u-\eta_D R_\theta(u)$，则
+\begin{equation}
+\label{eq:denoiser-lip}
+    \Lip(D_\theta)\le1+\eta_D L_R.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+对任意 $u,v\in\mathcal U_{\mathrm{adm}}$，
+\begin{equation}
+\begin{aligned}
+    \norm{D_\theta(u)-D_\theta(v)}
+    &=\norm{u-v-\eta_D(R_\theta(u)-R_\theta(v))}\\
+    &\le\norm{u-v}
+    +\eta_D\norm{R_\theta(u)-R_\theta(v)}\\
+    &\le(1+\eta_D L_R)\norm{u-v}.
+\end{aligned}
+\end{equation}
+取上确界即得结论。
+\end{proof}
+
+\begin{proposition}[去噪损失输出梯度界]
+\label{prop:loss-gradient}
+对固定 $x_c$，式 \eqref{eq:LD-def} 关于输出 $u=D_\theta(y_c)$ 的梯度满足
+\begin{equation}
+\label{eq:loss-gradient-bound}
+    \norm{\nabla_u\cL_D}\le L_\ell,
+\end{equation}
+其中 $L_\ell<\infty$ 依赖像素数 $m$、$\norm{G_\sigma}$、$\norm{K_{\mathrm{low}}}$、$\lambda_g$、$\lambda_{\mathrm{low}}$ 以及局部输出域。
+\end{proposition}
+
+\begin{proof}
+第一项中每个像素的 Charbonnier 导数绝对值不超过 $1$。保护权重满足 $0\le\omega_i(x_c)\le1$，只会缩小或保持该项的逐像素梯度幅度，因此其输出梯度的 $\ell_2$ 范数不超过 $\sqrt m$。第二项是 Charbonnier 惩罚与有界线性算子 $G_\sigma$ 的复合，链式法则给出梯度范数上界 $\lambda_g C_G\norm{G_\sigma}$，其中 $C_G$ 由梯度图像维度决定。第三项是 $\ell_1$ 损失与有界线性算子 $K_{\mathrm{low}}$ 的复合，在避开不可微点时梯度范数由 $\lambda_{\mathrm{low}} C_K\norm{K_{\mathrm{low}}}$ 控制；在不可微点处取 Clarke 次梯度同样有界。三项相加得到有限常数 $L_\ell$。
+\end{proof}
+
+\begin{proposition}[中心残差泄漏界]
+\label{prop:residual-leakage}
+定义理想高通噪声残差误差
+\begin{equation}
+\label{eq:leakage-def}
+    \Delta_h:=\hat r_h-\cH_\tau n_h.
+\end{equation}
+在 A1、A4、A5、A8 成立时，存在由 EMA 锚点偏差诱导的优化项 $\varepsilon_{\mathrm{opt}}(\epsilon_A+\epsilon_{\mathrm{ema}})$，使
+\begin{equation}
+\label{eq:leakage-bound}
+\begin{aligned}
+    \E\norm{\Delta_h}
+    \le&\ c_0\kappa\Delta z^2
+    +\E\norm{\cH_\tau\ell_h}
+    +\epsilon_P
+    +L_P\E\big(\norm{n_{h-1}}+\norm{n_{h+1}}\big)\\
+    &+\varepsilon_{\mathrm{opt}}(\epsilon_A+\epsilon_{\mathrm{ema}})
+    +\epsilon_{\mathrm{gate}}.
+\end{aligned}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+由定义和观测模型，
+\begin{equation}
+\begin{aligned}
+    \Delta_h
+    &=\cH_\tau(x_h-P_\phi(x_{h-1},x_{h+1}))-\cH_\tau n_h\\
+    &=\cH_\tau(s_h-P_\phi(x_{h-1},x_{h+1})).
+\end{aligned}
+\end{equation}
+将 $s_h=s_h^{\mathrm{sm}}+\ell_h$ 代入，并使用 $\norm{\cH_\tau}\le1$，得到
+\begin{equation}
+    \norm{\Delta_h}
+    \le
+    \norm{s_h^{\mathrm{sm}}-P_\phi(x_{h-1},x_{h+1})}
+    +\norm{\cH_\tau\ell_h}.
+\end{equation}
+继续加减 $P_\phi(s_{h-1},s_{h+1})$：
+\begin{equation}
+\begin{aligned}
+    \norm{s_h^{\mathrm{sm}}-P_\phi(x_{h-1},x_{h+1})}
+    \le&
+    \norm{s_h^{\mathrm{sm}}-P_\phi(s_{h-1},s_{h+1})}\\
+    &+\norm{P_\phi(s_{h-1},s_{h+1})
+    -P_\phi(x_{h-1},x_{h+1})}.
+\end{aligned}
+\end{equation}
+第一项由 A5 中的表达误差和 A1 的二阶切片光滑性控制。第二项由 $P_\phi$ 的局部 Lipschitz 性控制：
+\begin{equation}
+    \norm{P_\phi(s_{h-1},s_{h+1})
+    -P_\phi(x_{h-1},x_{h+1})}
+    \le L_P(\norm{n_{h-1}}+\norm{n_{h+1}}).
+\end{equation}
+由于 $P_\phi$ 实际通过 EMA anchor 训练，锚点偏差不会作为前向输入扰动出现，而是改变局部优化解，因此以 $\varepsilon_{\mathrm{opt}}(\epsilon_A+\epsilon_{\mathrm{ema}})$ 进入。门控后仍可能存在的低频结构投影由 A4 的 $\epsilon_{\mathrm{gate}}$ 记录。取期望即得式 \eqref{eq:leakage-bound}。
+\end{proof}
+
+\begin{proposition}[标量注入的条件均值控制]
+\label{prop:conditional-mean}
+在 A2、A3 成立时，合成输入 $y_c=x_c+\alpha_tT_t(\hat r_h)$ 满足
+\begin{equation}
+\label{eq:conditional-mean}
+    \E[y_c\mid x_c]
+    =
+    x_c+\alpha_t a_t(\mu^\star-\hat\mu_t)
+    +\alpha_t a_t\E[\Delta_h],
+\end{equation}
+因此
+\begin{equation}
+\label{eq:conditional-mean-bound}
+    \E\norm{\E[y_c\mid x_c]-x_c}
+    \le
+    \alpha_{\max}a_{\max}
+    \left(
+    \epsilon_\mu+\E\norm{\Delta_h}
+    \right).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+由 $\hat r_h=\cH_\tau n_h+\Delta_h$ 与 $T_t(u)=a_t(u-\hat\mu_t)$，
+\begin{equation}
+    y_c=x_c+\alpha_ta_t(\cH_\tau n_h+\Delta_h-\hat\mu_t).
+\end{equation}
+根据 A2，残差来源与 $x_c$ 条件独立。因此给定 $x_c$ 后，
+\begin{equation}
+    \E[y_c\mid x_c]
+    =
+    x_c+\alpha_ta_t
+    \left(
+    \E[\cH_\tau n_h]+\E[\Delta_h]-\hat\mu_t
+    \right).
+\end{equation}
+记 $\E[\cH_\tau n_h]=\mu^\star$，得到式 \eqref{eq:conditional-mean}。再使用 $\alpha_t\le\alpha_{\max}$、$a_t\le a_{\max}$、三角不等式和 A3 中的均值估计误差，即得式 \eqref{eq:conditional-mean-bound}。
+\end{proof}
+
+\begin{proposition}[实际注入分布的 Wasserstein 偏差]
+\label{prop:wasserstein-shift}
+令实际注入噪声为
+\begin{equation}
+    \zeta_h=\alpha_tT_t(\hat r_h),
+\end{equation}
+理想注入噪声为 $\xi$。在 A3 与命题 \ref{prop:residual-leakage} 成立时，
+\begin{equation}
+\label{eq:wasserstein-shift}
+    W_1\big(\mathcal L(\zeta_h),\mathcal L(\xi)\big)
+    \le
+    \epsilon_{\mathrm{cal}}
+    +\alpha_{\max}a_{\max}
+    \left(
+    \E\norm{\Delta_h}+\epsilon_\mu
+    \right).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+考虑分解
+\begin{equation}
+    \zeta_h
+    =
+    \alpha_tT_t(\cH_\tau n_h)
+    +\alpha_ta_t\Delta_h
+    +\alpha_ta_t(\mu^\star-\hat\mu_t)
+    -\alpha_ta_t\mu^\star,
+\end{equation}
+其中最后两项只是将中心化误差显式写出。由 A3，理想化的 $\alpha_tT_t(\cH_\tau n_h)$ 与 $\xi$ 的 Wasserstein-1 距离不超过 $\epsilon_{\mathrm{cal}}$。Wasserstein-1 距离满足三角不等式，并且加性扰动的分布距离可由扰动一阶矩控制。因此
+\begin{equation}
+    W_1(\mathcal L(\zeta_h),\mathcal L(\xi))
+    \le
+    \epsilon_{\mathrm{cal}}
+    +\E\norm{\alpha_ta_t\Delta_h}
+    +\E\norm{\alpha_ta_t(\hat\mu_t-\mu^\star)}.
+\end{equation}
+使用 $\alpha_t\le\alpha_{\max}$、$a_t\le a_{\max}$ 和 A3 即得结论。
+\end{proof}
+
+\begin{proposition}[noisier-to-noisy population 偏差分解]
+\label{prop:n2n-bias}
+令 $D^\star(y)=\E[x\mid y]$ 为理想注入分布下的平方损失 population minimizer，令 $D^\star_{\mathrm{act}}$ 为实际标量残差注入分布下的 population 解。若 A6、A7 与命题 \ref{prop:wasserstein-shift} 成立，且 population 解对注入分布扰动在局部 Lipschitz 意义下稳定，则存在常数 $C_{\mathrm{dist}}<\infty$，使
+\begin{equation}
+\label{eq:n2n-bias}
+\begin{aligned}
+    \E\norm{D^\star_{\mathrm{act}}(x)-s}
+    \le&
+    \epsilon_{\mathrm{N2N}}
+    +C_{\mathrm{dist}}\epsilon_{\mathrm{cal}}\\
+    &+C_{\mathrm{dist}}\alpha_{\max}a_{\max}
+    \left(
+    \E\norm{\Delta_h}+\epsilon_\mu
+    \right).
+\end{aligned}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+平方损失的 Bayes 最优解为条件期望，因此理想注入分布下的解满足 A7 中的偏差界
+\begin{equation}
+    \E\norm{D^\star(x)-s}\le\epsilon_{\mathrm{N2N}}.
+\end{equation}
+实际训练分布与理想训练分布之间的差异由命题 \ref{prop:wasserstein-shift} 控制。若局部风险关于输入分布扰动是 Lipschitz 稳定的，则 population 解的输出偏差可由该 Wasserstein 距离乘以常数 $C_{\mathrm{dist}}$ 控制。于是
+\begin{equation}
+    \E\norm{D^\star_{\mathrm{act}}(x)-D^\star(x)}
+    \le C_{\mathrm{dist}}
+    W_1(\mathcal L(\zeta_h),\mathcal L(\xi)).
+\end{equation}
+再使用三角不等式与式 \eqref{eq:wasserstein-shift} 即得式 \eqref{eq:n2n-bias}。
+\end{proof}
+
+\begin{proposition}[风险摄动界]
+\label{prop:risk-perturbation}
+记理想注入风险为 $\mathcal R_{\mathrm{ideal}}$，实际标量残差注入风险为 $\mathcal R_{\mathrm{act}}$。在 A2、A3、A6 与命题 \ref{prop:loss-gradient}、\ref{prop:residual-leakage} 成立时，
+\begin{equation}
+\label{eq:risk-perturbation}
+    \abs{\mathcal R_{\mathrm{act}}-\mathcal R_{\mathrm{ideal}}}
+    \le
+    L_\ell L_D
+    \left[
+    \epsilon_{\mathrm{cal}}
+    +\alpha_{\max}a_{\max}
+    \left(
+    \E\norm{\Delta_h}+\epsilon_\mu
+    \right)
+    \right].
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+对固定去噪器 $D_\theta$，实际输入与理想输入的差异为实际注入噪声 $\zeta_h$ 与理想注入噪声 $\xi$ 的差异。由命题 \ref{prop:loss-gradient}，损失关于输出是 $L_\ell$-Lipschitz；由 A6，去噪器关于输入是 $L_D$-Lipschitz。因此逐样本损失差满足
+\begin{equation}
+    \abs{\ell(D_\theta(x+\zeta_h),x)-\ell(D_\theta(x+\xi),x)}
+    \le L_\ell L_D\norm{\zeta_h-\xi}.
+\end{equation}
+对最优耦合取期望得到 Wasserstein-1 控制，再应用命题 \ref{prop:wasserstein-shift} 即得风险摄动界。
+\end{proof}
+
+\begin{proposition}[EMA 锚点误差传播]
+\label{prop:ema-anchor}
+设 $D_{\bar\theta}$ 由式 \eqref{eq:ema-theta} 更新，且在局部可容许域内
+\begin{equation}
+    \norm{D_{\theta_{t+1}}(x)-D_{\theta_t}(x)}\le\delta_t(x).
+\end{equation}
+则 EMA 输出漂移满足递推
+\begin{equation}
+\label{eq:ema-drift-recursion}
+    d_{t+1}
+    \le
+    \rho_{\mathrm{ema}}d_t+
+    \rho_{\mathrm{ema}}\E[\delta_t(x)],
+\end{equation}
+其中
+\begin{equation}
+    d_t:=\E\norm{D_{\theta_t}(x)-D_{\bar\theta_t}(x)}.
+\end{equation}
+若 $\E[\delta_t(x)]\le\bar\delta$，则
+\begin{equation}
+\label{eq:ema-drift-bound}
+    \limsup_{t\to\infty}d_t
+    \le
+    \frac{\rho_{\mathrm{ema}}}{1-\rho_{\mathrm{ema}}}\bar\delta.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+EMA 参数更新使 $D_{\bar\theta_{t+1}}$ 位于旧 EMA 模型与当前模型之间的局部插值轨迹上。在线性化局部域内，输出差可按同样系数控制：
+\begin{equation}
+    \norm{D_{\theta_{t+1}}(x)-D_{\bar\theta_{t+1}}(x)}
+    \le
+    \rho_{\mathrm{ema}}
+    \norm{D_{\theta_{t+1}}(x)-D_{\bar\theta_t}(x)}.
+\end{equation}
+加减 $D_{\theta_t}(x)$ 并使用三角不等式，得到
+\begin{equation}
+\begin{aligned}
+    \norm{D_{\theta_{t+1}}(x)-D_{\bar\theta_{t+1}}(x)}
+    \le&
+    \rho_{\mathrm{ema}}
+    \norm{D_{\theta_t}(x)-D_{\bar\theta_t}(x)}\\
+    &+\rho_{\mathrm{ema}}
+    \norm{D_{\theta_{t+1}}(x)-D_{\theta_t}(x)}.
+\end{aligned}
+\end{equation}
+取期望得到式 \eqref{eq:ema-drift-recursion}。递推两侧取 $\limsup$，若 $\E[\delta_t]\le\bar\delta$，则
+\begin{equation}
+    \limsup d_{t+1}
+    \le
+    \rho_{\mathrm{ema}}\limsup d_t+
+    \rho_{\mathrm{ema}}\bar\delta,
+\end{equation}
+移项得到式 \eqref{eq:ema-drift-bound}。
+\end{proof}
+
+\begin{proposition}[双反馈闭环误差界]
+\label{prop:closed-loop}
+若 A9 成立，则残差误差与锚点误差满足
+\begin{equation}
+\label{eq:closed-loop-R}
+    e_R
+    \le
+    \frac{B_R+C_AB_A}{1-C_AC_R},
+\end{equation}
+且
+\begin{equation}
+\label{eq:closed-loop-A}
+    e_A
+    \le
+    B_A+
+    C_R\frac{B_R+C_AB_A}{1-C_AC_R}.
+\end{equation}
+若 $C_AC_R\ge1$，该界不再提供有限压缩保证，双反馈可能进入退化平衡或振荡。
+\end{proposition}
+
+\begin{proof}
+由 A9，
+\begin{equation}
+    e_R\le B_R+C_Ae_A,
+    \qquad
+    e_A\le B_A+C_Re_R.
+\end{equation}
+将第二个不等式代入第一个，得到
+\begin{equation}
+    e_R\le B_R+C_AB_A+C_AC_Re_R.
+\end{equation}
+由于 $C_AC_R<1$，移项可得式 \eqref{eq:closed-loop-R}。再将该上界代回 $e_A\le B_A+C_Re_R$，得到式 \eqref{eq:closed-loop-A}。当 $C_AC_R\ge1$ 时，递推映射不再是压缩映射，线性不等式无法给出有限稳定上界。
+\end{proof}
+
+\begin{theorem}[两时间尺度随机逼近的局部兼容性]
+\label{thm:two-timescale}
+在 A1--A11 成立、迭代保持在局部可容许紧集内时，联合迭代 $(\phi_t,\theta_t,\bar\theta_t)$ 与两时间尺度随机逼近框架局部兼容。固定 $\phi$ 时，快变量 $\theta_t$ 跟踪局部稳定分支
+\begin{equation}
+    \theta_t\approx\lambda(\phi_t).
+\end{equation}
+若约化慢系统收敛到局部稳定点 $\phi^\star$，则存在对应快系统平衡 $\theta^\star=\lambda(\phi^\star)$，并且在局部意义下
+\begin{equation}
+    (\phi_t,\theta_t)\to(\phi^\star,\theta^\star).
+\end{equation}
+EMA 参数 $\bar\theta_t$ 跟踪 $\theta_t$ 的平滑版本，并在 A8 的输出漂移条件下保持局部锚点误差有界。
+\end{theorem}
+
+\begin{proof}
+A10 给出标准两时间尺度步长条件：去噪器为快变量，结构预测器为慢变量。A6、命题 \ref{lem:residual-block} 和命题 \ref{prop:denoiser-lip} 给出局部 Lipschitz 与有界性；命题 \ref{prop:loss-gradient} 给出损失梯度有界；A11 给出 martingale difference 梯度噪声与二阶矩控制；A9 排除局部非压缩反馈。根据两时间尺度随机逼近理论，快系统在固定 $\phi$ 时收敛或跟踪局部稳定吸引分支 $\lambda(\phi)$，慢系统沿该分支演化，并由局部 Lyapunov 函数保证收敛到局部稳定点。EMA 递推是对快变量的稳定线性滤波；由命题 \ref{prop:ema-anchor}，只要单步输出漂移有界，EMA 锚点误差不会破坏局部紧性。因此联合系统与两时间尺度框架兼容。该定理不声明全局收敛，也不保证局部平衡必然达到临床最优去噪质量。
+\end{proof}
+
+\begin{corollary}[稳定双反馈模型的总体误差接口]
+\label{cor:overall}
+在上述假设和命题成立时，实际推理输出的 clean 偏差可由
+\begin{equation}
+\label{eq:overall-error}
+\begin{aligned}
+    \E\norm{D^\star_{\mathrm{act}}(x)-s}
+    \le&
+    \epsilon_{\mathrm{N2N}}
+    +C_{\mathrm{dist}}\epsilon_{\mathrm{cal}}\\
+    &+C_{\mathrm{dist}}\alpha_{\max}a_{\max}
+    \left[
+    c_0\kappa\Delta z^2
+    +\E\norm{\cH_\tau\ell_h}
+    +\epsilon_P
+    +L_P\E(\norm{n_{h-1}}+\norm{n_{h+1}})\right.\\
+    &\left.
+    +\varepsilon_{\mathrm{opt}}(\epsilon_A+\epsilon_{\mathrm{ema}})
+    +\epsilon_{\mathrm{gate}}
+    +\epsilon_\mu
+    \right].
+\end{aligned}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+将命题 \ref{prop:residual-leakage} 中的 $\E\norm{\Delta_h}$ 上界代入命题 \ref{prop:n2n-bias} 即得。该推论把总体误差分解为 noisier-to-noisy 不可约偏差、标量校准偏差、残差泄漏、层特异结构、邻层噪声、锚点偏差、门控残留和均值估计误差。
+\end{proof}
+
+\section{可执行默认配置}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{p{0.28\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+模块 & 默认实现 & 稳定性作用 \\
+\midrule
+结构预测器 $P_\phi$ & 3--5 层浅层 U-Net 或残差 CNN & 降低表达复杂度，减少锚点反馈放大。 \\
+去噪器 $D_\theta$ & $D_\theta(x)=x-\eta_DR_\theta(x)$，小型 DnCNN/U-Net & 让网络学习残差，便于动态范围控制。 \\
+残差注入 & 标量注入，$0.02\le\alpha_t\le0.15$ & 保留降噪压力，避免恒等映射。 \\
+残差统计 & EMA 均值与方差，$a_t\le a_{\max}$ & 控制条件均值漂移与强度爆炸。 \\
+质量门控 & 固定 $q_{\mathrm{low}},q_{\mathrm{corr}}$ 阈值 & 抑制低频结构泄漏。 \\
+结构保护 & $\omega_i(x_c)\in[0,1]$，默认可取全 $1$ & 降低疑似微小结构区域的去噪梯度压力。 \\
+EMA anchor & $\rho_{\mathrm{ema}}\in[0.99,0.999]$ & 平滑结构反馈，降低 loss 震荡。 \\
+联合训练 & $D$ 每步更新，$P$ 每 $5$--$10$ 步更新一次 & 近似两时间尺度。 \\
+\bottomrule
+\end{tabular}
+\caption{稳定双反馈架构的可执行默认配置。}
+\label{tab:default-config}
+\end{table}
+
+\section{失效场景与限制}
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{p{0.30\linewidth}p{0.24\linewidth}p{0.36\linewidth}}
+\toprule
+失效场景 & 破坏的条件 & 后果 \\
+\midrule
+注入强度过大 & A3, A7 & 训练输入远比推理输入更噪，输出可能过度平滑或动态范围收缩。 \\
+注入强度过小或 $\alpha_{\min}=0$ & 训练目标设计 & 训练对接近恒等映射，去噪器缺少有效降噪压力。 \\
+结构预测器过快更新 & A9, A10 & 锚点和残差池互相污染，loss 震荡或进入退化闭环。 \\
+EMA 衰减过小 & A8 & 锚点跟随当前去噪器噪声振荡，结构反馈不稳定。 \\
+单层微小病灶或钙化 & A1, A4, 损失设计 & 若门控或 $\omega_i$ 保护失效，层特异结构可能被学习为应去除成分。 \\
+残差均值或尺度估计漂移 & A3 & 合成输入条件均值偏移，风险摄动项变大。 \\
+采集协议混杂严重 & A2, A3, A7 & 单一标量归一化无法匹配不同噪声统计，noisier-to-noisy 偏差增大。 \\
+\bottomrule
+\end{tabular}
+\caption{稳定双反馈模型的典型失效场景。}
+\label{tab:limitations}
+\end{table}
+
+\section{必要实证验证}
+
+\subsection{训练--推理强度一致性}
+
+必须比较 $y_c$、$x_c$、推理输入 $x$ 和输出 $D_\theta(x)$ 的均值、方差、分位数、低频标准差、HU 直方图和局部对比度。若输出低频标准差系统性低于输入，应降低 $\alpha_{\max}$、增大低频一致性权重或减小去噪残差缩放 $\eta_D$。
+
+\subsection{残差噪声性验证}
+
+必须报告通过门控残差的 $q_{\mathrm{low}}$、$q_{\mathrm{corr}}$、功率谱、方向性伪影分量、均值漂移和尺度稳定性。需要比较无门控、仅低频门控、低频加相关性门控三组实验。
+
+\subsection{双反馈稳定性验证}
+
+必须记录 $\cL_D$、$\cL_P$、$\norm{D_\theta(x)-D_{\bar\theta}(x)}$、残差池接受率、$\hat\mu_t$ 和 $\hat\sigma_{r,t}$ 的时间曲线。若 $\cL_D$ 与 $\cL_P$ 同步震荡，应增大 $\rho_{\mathrm{ema}}$、降低 $\eta_\phi/\eta_\theta$ 或延长阶段 I 与阶段 II。
+
+\subsection{微小结构保护验证}
+
+应对人工植入或已标注的微小结节、钙化点、细小骨折线进行敏感性测试，报告去噪前后病灶对比度、体积、最大 HU、边缘梯度和检测模型召回率。需要比较 $\omega_i\equiv1$、启发式保护权重和检测器保护权重三种设置。该验证直接对应式 \eqref{eq:overall-error} 中的 $\E\norm{\cH_\tau\ell_h}$ 项，也检验式 \eqref{eq:protection-weight} 是否真正降低了微小结构区域的去噪压力。
+
+\section{结论}
+
+本文构建了 HorusEye-TR v2.0 的稳定双反馈理论框架。模型只保留两个必要反馈：noisier-to-noisy 去噪反馈为去噪器提供非恒等训练压力，denoised-anchor 结构反馈改善结构预测器并间接提升残差质量。架构层面采用轻量卷积网络、残差形式输出、标量残差归一化、固定质量门控、空间结构保护权重、EMA 锚点和两时间尺度训练，使实现路径更直接，也使理论假设更容易被实验检查。
+
+理论上，本文给出残差泄漏、条件均值漂移、注入分布偏差、population clean 偏差、风险摄动、EMA 锚点漂移和闭环压缩的显式接口。结论均为局部且条件性的：只有当残差足够噪声化、标量注入分布足够接近理想噪声、EMA 锚点进入局部盆地、双反馈误差传递满足压缩条件，并且训练迭代保持在局部可容许域内时，该框架的训练动力学和风险扰动才能被量化控制。
+
+实际应用中仍必须通过强度一致性、残差噪声性、双反馈稳定性和微小结构保护实验验证这些条件是否近似成立。该版本的理论价值在于为一个更小、更稳、更容易复现的自监督 CT 去噪系统提供可审计的数学接口。
+
+\end{document}
