@@ -43,14 +43,19 @@ class HorusEyeConfig:
 
 
 class ZarrTripletDataset(Dataset):
-    def __init__(self, data_root: str | Path, patch_size: int = 128, samples_per_epoch: int = 4096):
+    def __init__(self, data_root: str | Path, patch_size: int = 128, samples_per_epoch: int = 4096, include_hr: bool = False):
         self.data_root = Path(data_root)
         self.patch_size = patch_size
         self.samples_per_epoch = samples_per_epoch
+        self.include_hr = include_hr
         self.volume_paths = [p / "REG" / "0" for p in sorted(self.data_root.glob("covid-*.zarr")) if (p / "REG" / "0" / "zarr.json").exists()]
         if len(self.volume_paths) < 2:
             raise RuntimeError("Need at least two covid-*.zarr/REG/0 volumes for cross-volume residual injection.")
+        self.hr_volume_paths = [path.parents[1] / "HR" / "0" for path in self.volume_paths]
+        if self.include_hr and not all((path / "zarr.json").exists() for path in self.hr_volume_paths):
+            raise RuntimeError("HR denoiser training needs paired covid-*.zarr/HR/0 volumes for every REG/0 volume.")
         self.volumes: list[Any] | None = None
+        self.hr_volumes: list[Any] | None = None
         self._open_volumes()
         assert self.volumes is not None
         self.shapes = [tuple(v.shape) for v in self.volumes]
@@ -58,6 +63,7 @@ class ZarrTripletDataset(Dataset):
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["volumes"] = None
+        state["hr_volumes"] = None
         return state
 
     def __len__(self) -> int:
@@ -66,8 +72,10 @@ class ZarrTripletDataset(Dataset):
     def _open_volumes(self) -> None:
         if self.volumes is None:
             self.volumes = [zarr.open(str(path), mode="r") for path in self.volume_paths]
+        if self.include_hr and self.hr_volumes is None:
+            self.hr_volumes = [zarr.open(str(path), mode="r") for path in self.hr_volume_paths]
 
-    def _sample_patch(self, vol_idx: int, z: int | None = None) -> tuple[Tensor, Tensor, Tensor]:
+    def _sample_patch(self, vol_idx: int, z: int | None = None, include_hr: bool = False) -> tuple[Tensor, ...]:
         self._open_volumes()
         assert self.volumes is not None
         vol = self.volumes[vol_idx]
@@ -79,8 +87,16 @@ class ZarrTripletDataset(Dataset):
         xs = slice(x0, x0 + self.patch_size)
         triplet = np.asarray(vol[z - 1 : z + 2, ys, xs], dtype=np.float32)
         lo, hi = np.percentile(triplet, (0.5, 99.5))
-        triplet = np.clip((triplet - lo) / (hi - lo + 1e-6), 0.0, 1.0).astype(np.float32, copy=False)
-        return tuple(torch.from_numpy(triplet[i]).unsqueeze(0) for i in range(3))  # type: ignore[return-value]
+        scale = hi - lo + 1e-6
+        triplet = np.clip((triplet - lo) / scale, 0.0, 1.0).astype(np.float32, copy=False)
+        tensors = [torch.from_numpy(triplet[i]).unsqueeze(0) for i in range(3)]
+        if include_hr:
+            assert self.hr_volumes is not None
+            hr_vol = self.hr_volumes[vol_idx]
+            hr = np.asarray(hr_vol[z, ys, xs], dtype=np.float32)
+            hr = np.clip((hr - lo) / scale, 0.0, 1.0).astype(np.float32, copy=False)
+            tensors.append(torch.from_numpy(hr).unsqueeze(0))
+        return tuple(tensors)
 
     def __getitem__(self, _: int) -> dict[str, Tensor]:
         self._open_volumes()
@@ -90,8 +106,12 @@ class ZarrTripletDataset(Dataset):
         if c_idx >= h_idx:
             c_idx += 1
         hm1, h, hp1 = self._sample_patch(h_idx)
-        _, c, _ = self._sample_patch(c_idx)
-        return {"h_m1": hm1, "h": h, "h_p1": hp1, "c": c}
+        c_patch = self._sample_patch(c_idx, include_hr=self.include_hr)
+        _, c, *_ = c_patch
+        sample = {"h_m1": hm1, "h": h, "h_p1": hp1, "c": c}
+        if self.include_hr:
+            sample["c_hr"] = c_patch[3]
+        return sample
 
 
 class ResidualBlock(nn.Module):

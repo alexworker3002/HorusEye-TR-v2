@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--highpass-sigma", type=float, default=2.0)
     p.add_argument("--gate-blur-kernel-size", type=int, default=11)
     p.add_argument("--gate-blur-sigma", type=float, default=2.5)
+    p.add_argument("--denoiser-target", choices=("reg", "hr"), default="reg", help="Clean image used for denoiser noise-injection training.")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--save-sample-every", type=int, default=1)
     p.add_argument("--resume-checkpoint", "--resume", type=Path, default=None, dest="resume_checkpoint")
@@ -364,16 +365,16 @@ def plot_metrics(csv_path: Path, out_path: Path) -> None:
     plt.close(fig)
 
 
-def save_visual_sample(model: HorusEyeTR, batch: dict[str, torch.Tensor], path: Path, alpha: float) -> None:
+def save_visual_sample(model: HorusEyeTR, batch: dict[str, torch.Tensor], path: Path, alpha: float, denoiser_target: str) -> None:
     model.eval()
     with torch.no_grad():
+        clean = batch["c_hr"] if denoiser_target == "hr" and "c_hr" in batch else batch["c"]
         residual = model.raw_residual(batch["h_m1"], batch["h"], batch["h_p1"], use_initial=False)
         low, corr = model.gate_scores(residual, batch["h"])
         mask = model.gate_mask(residual, batch["h"])
         z = model.normalize_residual(residual)
-        noisy_plus = torch.clamp(batch["c"] + alpha * z, 0.0, 1.0)
+        noisy_plus = torch.clamp(clean + alpha * z, 0.0, 1.0)
         denoised = model.denoiser(noisy_plus)
-        anchor = model.ema_denoiser(batch["h"])
         accepted = float(mask.mean().detach().cpu())
         sample_accepted = bool(mask[0].item() > 0)
         sample_low = float(low[0].detach().cpu())
@@ -381,11 +382,11 @@ def save_visual_sample(model: HorusEyeTR, batch: dict[str, torch.Tensor], path: 
     save_image_grid(
         path,
         [
-            ("base noisy x_c", batch["c"][0]),
+            ("base REG x_c", batch["c"][0]),
             ("injected y_c", noisy_plus[0]),
             ("denoised D(y_c)", denoised[0]),
             ("center x_h", batch["h"][0]),
-            ("EMA anchor", anchor[0]),
+            (f"clean target {denoiser_target}", clean[0]),
             (
                 f"residual used={int(sample_accepted)} batch={accepted:.2f} low={sample_low:.3f} corr={sample_corr:.3f}",
                 (residual[0] - residual[0].min()) / (residual[0].amax() - residual[0].amin() + 1e-6),
@@ -410,7 +411,7 @@ def train() -> None:
         cfg = HorusEyeConfig(patch_size=args.patch_size)
     cfg = apply_config_overrides(cfg, args)
 
-    data = ZarrTripletDataset(args.data_root, patch_size=cfg.patch_size, samples_per_epoch=args.samples_per_epoch)
+    data = ZarrTripletDataset(args.data_root, patch_size=cfg.patch_size, samples_per_epoch=args.samples_per_epoch, include_hr=args.denoiser_target == "hr")
     loader = make_loader(args, data)
     model = HorusEyeTR(cfg).to(args.device)
     opt_d = torch.optim.AdamW(model.denoiser.parameters(), lr=args.lr_denoiser, weight_decay=1e-4)
@@ -479,15 +480,16 @@ def train() -> None:
             use_initial = stage == 1
             residual = model.raw_residual(b["h_m1"], b["h"], b["h_p1"], use_initial=use_initial)
             mask = model.gate_mask(residual.detach(), b["h"])
+            denoiser_clean = b["c_hr"] if args.denoiser_target == "hr" else b["c"]
             if stage in (1, 3):
-                model.update_stats(residual.detach(), b["c"], mask)
+                model.update_stats(residual.detach(), denoiser_clean, mask)
             current_alpha = model.alpha(global_step, warmup_steps)
             last_alpha = current_alpha
 
             denoiser_updated = 0.0
             if stage in (1, 3):
                 opt_d.zero_grad(set_to_none=True)
-                loss_d_or_none = model.denoiser_loss(b["c"], residual, mask, current_alpha)
+                loss_d_or_none = model.denoiser_loss(denoiser_clean, residual, mask, current_alpha)
                 if loss_d_or_none is None:
                     loss_d = torch.zeros((), device=args.device)
                 else:
@@ -528,7 +530,7 @@ def train() -> None:
 
         plot_metrics(metrics_csv, metrics_png)
         if last_batch is not None and args.save_sample_every > 0 and epoch % args.save_sample_every == 0:
-            save_visual_sample(model, last_batch, out["figures"] / f"sample_stage{stage}_epoch{epoch}.png", last_alpha)
+            save_visual_sample(model, last_batch, out["figures"] / f"sample_stage{stage}_epoch{epoch}.png", last_alpha, args.denoiser_target)
 
     for idx, (stage, epoch) in enumerate(schedule[start_index:], start=start_index):
         run_epoch(stage, epoch)

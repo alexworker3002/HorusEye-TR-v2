@@ -86,4 +86,26 @@ python scripts/infer_horuseye_tr.py \
   --device cuda
 ```
 
+## HR Evaluation
+
+Evaluate denoising against paired `HR/0` volumes before deciding whether to extend a run:
+
+```bash
+python scripts/eval_horuseye_tr_hr.py \
+  --checkpoint output/train_horuseye_tr_strict_gate_256/checkpoints/horuseye_tr_final.pt \
+  --data-root data \
+  --output-dir output/train_horuseye_tr_strict_gate_256/eval/hr_final \
+  --device cuda \
+  --slices 160 224 256 288 352 \
+  --save-comparisons 16
+```
+
+The script writes:
+
+- `hr_eval_metrics.csv`: per-volume/slice metrics for REG baseline, predictor `P(z-1,z+1)`, denoiser `D(REG)`, and joint output `D(P)`.
+- `hr_eval_summary.json`: aggregate PSNR/SSIM/MAE/RMSE deltas.
+- `comparisons/*.png`: REG, predictor, denoised, joint, HR, removed signal, and error maps.
+
+Treat a run as promising only if `delta_psnr_den`, `delta_psnr_pred`, `delta_psnr_joint` and the matching SSIM deltas are consistently positive, and the comparison figures do not show obvious anatomical structure in `REG - D(REG)`, `P - REG`, or `D(P) - D(REG)`.
+
 The training loader automatically discovers `data/covid-*.zarr/REG/0` volumes and samples axial slice triplets. Inference uses only the denoiser `D_theta(x)`.
