@@ -24,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate HorusEye-TR denoising against paired HR zarr volumes.")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--data-root", type=Path, default=ROOT / "data")
+    p.add_argument("--volume-glob", default="**/*.zarr", help="Glob under data-root selecting volume roots for this CT domain.")
+    p.add_argument("--reg-subpath", default="REG/0", help="Relative path from each volume root to the noisy/REG zarr array.")
+    p.add_argument("--hr-subpath", default="HR/2", help="Relative path from each volume root to the paired HR zarr array.")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--slices", type=int, nargs="*", default=[160, 224, 256, 288, 352])
@@ -125,19 +128,22 @@ def save_comparison(
         1e-4,
         float(np.percentile(np.abs(np.concatenate([reg_err.ravel(), pred_err.ravel(), den_err.ravel(), joint_err.ravel()])), 99.5)),
     )
-    fig, axes = plt.subplots(3, 4, figsize=(17, 12), constrained_layout=True)
+    fig, axes = plt.subplots(3, 5, figsize=(22, 13), constrained_layout=True)
     fig.suptitle(title)
     panels = [
         ("REG", reg, "gray", 0.0, 1.0),
-        ("Predictor P(z-1,z+1)", pred, "gray", 0.0, 1.0),
-        ("D(REG)", den, "gray", 0.0, 1.0),
-        ("Joint D(P)", joint, "gray", 0.0, 1.0),
         ("HR", hr, "gray", 0.0, 1.0),
-        ("REG - D(REG)", removed, "coolwarm", -vmax_removed, vmax_removed),
         ("REG - HR", reg_err, "coolwarm", -vmax_err, vmax_err),
-        ("P - HR", pred_err, "coolwarm", -vmax_err, vmax_err),
+        ("D(REG)", den, "gray", 0.0, 1.0),
         ("D(REG) - HR", den_err, "coolwarm", -vmax_err, vmax_err),
+        ("Predictor P(z-1,z+1)", pred, "gray", 0.0, 1.0),
+        ("HR", hr, "gray", 0.0, 1.0),
+        ("P - HR", pred_err, "coolwarm", -vmax_err, vmax_err),
+        ("Joint D(P)", joint, "gray", 0.0, 1.0),
         ("D(P) - HR", joint_err, "coolwarm", -vmax_err, vmax_err),
+        ("REG", reg, "gray", 0.0, 1.0),
+        ("D(REG)", den, "gray", 0.0, 1.0),
+        ("REG - D(REG)", removed, "coolwarm", -vmax_removed, vmax_removed),
         ("P - REG", pred - reg, "coolwarm", -vmax_err, vmax_err),
         ("D(P) - D(REG)", joint - den, "coolwarm", -vmax_err, vmax_err),
     ]
@@ -151,11 +157,13 @@ def save_comparison(
     plt.close(fig)
 
 
-def discover_pairs(data_root: Path) -> list[tuple[str, Path, Path]]:
+def discover_pairs(data_root: Path, volume_glob: str, reg_subpath: str, hr_subpath: str) -> list[tuple[str, Path, Path]]:
     pairs: list[tuple[str, Path, Path]] = []
-    for volume_root in sorted(data_root.glob("covid-*.zarr")):
-        reg = volume_root / "REG" / "0"
-        hr = volume_root / "HR" / "0"
+    reg_rel = Path(reg_subpath)
+    hr_rel = Path(hr_subpath)
+    for volume_root in sorted(data_root.glob(volume_glob)):
+        reg = volume_root / reg_rel
+        hr = volume_root / hr_rel
         if (reg / "zarr.json").exists() and (hr / "zarr.json").exists():
             pairs.append((volume_root.stem, reg, hr))
     return pairs
@@ -187,11 +195,15 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    pairs = discover_pairs(args.data_root)
+    pairs = discover_pairs(args.data_root, args.volume_glob, args.reg_subpath, args.hr_subpath)
     if args.max_volumes is not None:
         pairs = pairs[: args.max_volumes]
     if not pairs:
-        raise RuntimeError(f"No paired REG/0 and HR/0 zarr volumes found under {args.data_root}")
+        raise RuntimeError(
+            "No paired REG and HR zarr volumes found: "
+            f"data_root={args.data_root}, volume_glob={args.volume_glob}, "
+            f"reg_subpath={args.reg_subpath}, hr_subpath={args.hr_subpath}"
+        )
 
     rows: list[dict[str, Any]] = []
     comparison_count = 0
@@ -199,6 +211,11 @@ def main() -> None:
         for volume_name, reg_path, hr_path in pairs:
             reg_vol = zarr.open(str(reg_path), mode="r")
             hr_vol = zarr.open(str(hr_path), mode="r")
+            if reg_vol.shape != hr_vol.shape:
+                raise RuntimeError(
+                    f"REG and HR shapes must match for aligned evaluation: {reg_path} shape={reg_vol.shape}, "
+                    f"{hr_path} shape={hr_vol.shape}. Use a matching --hr-subpath such as HR/2 for REG/0."
+                )
             depth = min(reg_vol.shape[0], hr_vol.shape[0])
             for z in args.slices:
                 if z <= 0 or z >= depth - 1:
@@ -261,6 +278,9 @@ def main() -> None:
     summary = summarize(rows)
     summary["checkpoint"] = str(args.checkpoint)
     summary["data_root"] = str(args.data_root)
+    summary["volume_glob"] = args.volume_glob
+    summary["reg_subpath"] = args.reg_subpath
+    summary["hr_subpath"] = args.hr_subpath
     summary["slices"] = args.slices
     with (args.output_dir / "hr_eval_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)

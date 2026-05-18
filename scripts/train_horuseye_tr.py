@@ -5,6 +5,8 @@ import csv
 import json
 import random
 import re
+import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,9 @@ DEFAULT_OUTPUT_ROOT = ROOT / "output" / TRAIN_SCRIPT_NAME
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train HorusEye-TR stable dual-feedback self-supervised denoiser.")
     p.add_argument("--data-root", type=Path, default=ROOT / "data")
+    p.add_argument("--volume-glob", default="**/*.zarr", help="Glob under data-root selecting volume roots for this CT domain.")
+    p.add_argument("--reg-subpath", default="REG/0", help="Relative path from each volume root to the noisy/REG zarr array.")
+    p.add_argument("--hr-subpath", default="HR/2", help="Relative path from each volume root to the paired HR zarr array used as denoiser target.")
     p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch-size", type=int, default=4)
@@ -46,7 +51,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--highpass-sigma", type=float, default=2.0)
     p.add_argument("--gate-blur-kernel-size", type=int, default=11)
     p.add_argument("--gate-blur-sigma", type=float, default=2.5)
-    p.add_argument("--denoiser-target", choices=("reg", "hr"), default="reg", help="Clean image used for denoiser noise-injection training.")
+    p.add_argument(
+        "--denoiser-target",
+        choices=("hr", "reg"),
+        default="hr",
+        help="Target image used for denoiser noise-injection training. Predictor triplets always come from REG.",
+    )
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--save-sample-every", type=int, default=1)
     p.add_argument("--resume-checkpoint", "--resume", type=Path, default=None, dest="resume_checkpoint")
@@ -70,6 +80,62 @@ def ensure_output_dirs(output_root: Path) -> dict[str, Path]:
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
     return dirs
+
+
+def snapshot_run_scripts(dirs: dict[str, Path], args: argparse.Namespace) -> None:
+    script_paths = [
+        Path(__file__).resolve(),
+        ROOT / "scripts" / f"{INFERENCE_SCRIPT_NAME}.py",
+        ROOT / "scripts" / "eval_horuseye_tr_hr.py",
+    ]
+    for src in script_paths:
+        if src.exists():
+            shutil.copy2(src, dirs["inference_scripts"] / src.name)
+
+    repo_root = ROOT.resolve()
+    run_root = dirs["root"].resolve()
+    infer_launcher = dirs["inference_scripts"] / f"run_{INFERENCE_SCRIPT_NAME}.sh"
+    infer_launcher.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f"cd {shlex.quote(str(repo_root))}",
+                '"${PYTHON_BIN:-python3}" '
+                f"scripts/{INFERENCE_SCRIPT_NAME}.py "
+                f"--checkpoint {shlex.quote(str(run_root / 'checkpoints' / 'horuseye_tr_final.pt'))} "
+                f"--data-root {shlex.quote(str(args.data_root.resolve()))} "
+                f"--volume-glob {shlex.quote(args.volume_glob)} "
+                f"--reg-subpath {shlex.quote(args.reg_subpath)} "
+                f"--output-dir {shlex.quote(str(run_root / 'inference' / INFERENCE_SCRIPT_NAME))} "
+                '"$@"',
+                "",
+            ]
+        )
+    )
+    infer_launcher.chmod(0o755)
+
+    eval_launcher = dirs["inference_scripts"] / "run_eval_horuseye_tr_hr.sh"
+    eval_launcher.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f"cd {shlex.quote(str(repo_root))}",
+                '"${PYTHON_BIN:-python3}" '
+                "scripts/eval_horuseye_tr_hr.py "
+                f"--checkpoint {shlex.quote(str(run_root / 'checkpoints' / 'horuseye_tr_final.pt'))} "
+                f"--data-root {shlex.quote(str(args.data_root.resolve()))} "
+                f"--volume-glob {shlex.quote(args.volume_glob)} "
+                f"--reg-subpath {shlex.quote(args.reg_subpath)} "
+                f"--hr-subpath {shlex.quote(args.hr_subpath)} "
+                f"--output-dir {shlex.quote(str(run_root / 'eval' / 'hr_final'))} "
+                '"$@"',
+                "",
+            ]
+        )
+    )
+    eval_launcher.chmod(0o755)
 
 
 def append_csv(path: Path, row: dict[str, Any]) -> None:
@@ -411,7 +477,17 @@ def train() -> None:
         cfg = HorusEyeConfig(patch_size=args.patch_size)
     cfg = apply_config_overrides(cfg, args)
 
-    data = ZarrTripletDataset(args.data_root, patch_size=cfg.patch_size, samples_per_epoch=args.samples_per_epoch, include_hr=args.denoiser_target == "hr")
+    snapshot_run_scripts(out, args)
+
+    data = ZarrTripletDataset(
+        args.data_root,
+        patch_size=cfg.patch_size,
+        samples_per_epoch=args.samples_per_epoch,
+        include_hr=args.denoiser_target == "hr",
+        volume_glob=args.volume_glob,
+        reg_subpath=args.reg_subpath,
+        hr_subpath=args.hr_subpath,
+    )
     loader = make_loader(args, data)
     model = HorusEyeTR(cfg).to(args.device)
     opt_d = torch.optim.AdamW(model.denoiser.parameters(), lr=args.lr_denoiser, weight_decay=1e-4)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -13,6 +14,12 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 import zarr
+
+
+def read_zarr_shape(path: str | Path) -> tuple[int, ...]:
+    metadata_path = Path(path) / "zarr.json"
+    metadata = json.loads(metadata_path.read_text())
+    return tuple(int(dim) for dim in metadata["shape"])
 
 
 @dataclass
@@ -43,17 +50,52 @@ class HorusEyeConfig:
 
 
 class ZarrTripletDataset(Dataset):
-    def __init__(self, data_root: str | Path, patch_size: int = 128, samples_per_epoch: int = 4096, include_hr: bool = False):
+    """Sample REG triplets for the predictor and an aligned REG/HR center target for the denoiser."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        patch_size: int = 128,
+        samples_per_epoch: int = 4096,
+        include_hr: bool = False,
+        volume_glob: str = "**/*.zarr",
+        reg_subpath: str = "REG/0",
+        hr_subpath: str = "HR/2",
+    ):
         self.data_root = Path(data_root)
         self.patch_size = patch_size
         self.samples_per_epoch = samples_per_epoch
         self.include_hr = include_hr
-        self.volume_paths = [p / "REG" / "0" for p in sorted(self.data_root.glob("covid-*.zarr")) if (p / "REG" / "0" / "zarr.json").exists()]
+        self.volume_glob = volume_glob
+        self.reg_subpath = Path(reg_subpath)
+        self.hr_subpath = Path(hr_subpath)
+        self.volume_roots = [p for p in sorted(self.data_root.glob(self.volume_glob)) if (p / self.reg_subpath / "zarr.json").exists()]
+        self.volume_paths = [p / self.reg_subpath for p in self.volume_roots]
         if len(self.volume_paths) < 2:
-            raise RuntimeError("Need at least two covid-*.zarr/REG/0 volumes for cross-volume residual injection.")
-        self.hr_volume_paths = [path.parents[1] / "HR" / "0" for path in self.volume_paths]
+            raise RuntimeError(
+                "Need at least two REG volumes for cross-volume residual injection: "
+                f"data_root={self.data_root}, volume_glob={self.volume_glob}, reg_subpath={self.reg_subpath}"
+            )
+        self.hr_volume_paths = [p / self.hr_subpath for p in self.volume_roots]
         if self.include_hr and not all((path / "zarr.json").exists() for path in self.hr_volume_paths):
-            raise RuntimeError("HR denoiser training needs paired covid-*.zarr/HR/0 volumes for every REG/0 volume.")
+            raise RuntimeError(
+                "HR denoiser training needs paired HR volumes for every REG volume: "
+                f"data_root={self.data_root}, volume_glob={self.volume_glob}, hr_subpath={self.hr_subpath}"
+            )
+        if self.include_hr:
+            mismatched = []
+            for reg_path, hr_path in zip(self.volume_paths, self.hr_volume_paths):
+                reg_shape = read_zarr_shape(reg_path)
+                hr_shape = read_zarr_shape(hr_path)
+                if reg_shape != hr_shape:
+                    mismatched.append((reg_path, hr_path, reg_shape, hr_shape))
+            if mismatched:
+                details = "; ".join(f"{reg} shape={reg_shape} vs {hr} shape={hr_shape}" for reg, hr, reg_shape, hr_shape in mismatched[:3])
+                raise RuntimeError(
+                    "REG and HR arrays must have identical shapes for patch-aligned HR training. "
+                    "Choose a matching --hr-subpath, for example HR/2 for REG/0 or HR/3 for REG/1 in the current data. "
+                    f"Mismatches: {details}"
+                )
         self.volumes: list[Any] | None = None
         self.hr_volumes: list[Any] | None = None
         self._open_volumes()
