@@ -1,3 +1,7 @@
+# 中文说明：本脚本为 HorusEye-TR 主训练入口；2026-05-19 新增 no-GT 实验情景下的 HR 弱参考权重。
+# 测试用途：支持 REG 自监督训练、HR/0 强监督旧基线、以及 REG 主目标 + HR/0 弱参考的实验矩阵对比。
+# 评估配套：训练结束后应优先使用 eval_horuseye_tr_nogt.py 做主评估，HR/0 相似度只作为参考算法一致性辅助指标。
+# 预期结果：在没有真实 GT 的数据域中比较 denoiser 是否稳定去除噪声、减少结构误删和过平滑。
 from __future__ import annotations
 
 import argparse
@@ -17,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -57,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         default="hr",
         help="Target image used for denoiser noise-injection training. Predictor triplets always come from REG.",
     )
+    p.add_argument(
+        "--hr-reference-weight",
+        type=float,
+        default=0.0,
+        help="Optional weak consistency weight to paired HR/reference output. Use only when HR is a reference algorithm, not GT.",
+    )
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--save-sample-every", type=int, default=1)
     p.add_argument("--resume-checkpoint", "--resume", type=Path, default=None, dest="resume_checkpoint")
@@ -87,6 +98,7 @@ def snapshot_run_scripts(dirs: dict[str, Path], args: argparse.Namespace) -> Non
         Path(__file__).resolve(),
         ROOT / "scripts" / f"{INFERENCE_SCRIPT_NAME}.py",
         ROOT / "scripts" / "eval_horuseye_tr_hr.py",
+        ROOT / "scripts" / "eval_horuseye_tr_nogt.py",
     ]
     for src in script_paths:
         if src.exists():
@@ -483,7 +495,7 @@ def train() -> None:
         args.data_root,
         patch_size=cfg.patch_size,
         samples_per_epoch=args.samples_per_epoch,
-        include_hr=args.denoiser_target == "hr",
+        include_hr=args.denoiser_target == "hr" or args.hr_reference_weight > 0.0,
         volume_glob=args.volume_glob,
         reg_subpath=args.reg_subpath,
         hr_subpath=args.hr_subpath,
@@ -570,6 +582,11 @@ def train() -> None:
                     loss_d = torch.zeros((), device=args.device)
                 else:
                     loss_d = loss_d_or_none
+                    if args.hr_reference_weight > 0.0:
+                        if "c_hr" not in b:
+                            raise RuntimeError("--hr-reference-weight requires paired HR/reference volumes in the batch.")
+                        den_ref = model.denoiser(b["c"])
+                        loss_d = loss_d + args.hr_reference_weight * F.smooth_l1_loss(den_ref, b["c_hr"])
                     loss_d.backward()
                     torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), 1.0)
                     opt_d.step()
